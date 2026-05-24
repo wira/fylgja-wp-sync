@@ -1,0 +1,56 @@
+{
+  "name": "fylgja-wp-sync (PHP + Claude Code)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "PHP_VERSION": "8.2",
+      "NODE_MAJOR": "22"
+    }
+  },
+  "remoteUser": "vscode",
+
+  // iptables/ipset need NET_ADMIN; NET_RAW lets us inspect packets if we ever need to.
+  "runArgs": [
+    "--cap-add=NET_ADMIN",
+    "--cap-add=NET_RAW"
+  ],
+
+  // Bind-mount host ~/.claude read-only at a side path so postCreateCommand
+  // can seed the container's ~/.claude from it without writing back to host.
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude-host,type=bind,readonly"
+  ],
+
+  "containerEnv": {
+    "HTTP_PROXY":  "${localEnv:HTTP_PROXY}",
+    "HTTPS_PROXY": "${localEnv:HTTPS_PROXY}",
+    "NO_PROXY":    "${localEnv:NO_PROXY}",
+    "http_proxy":  "${localEnv:http_proxy}",
+    "https_proxy": "${localEnv:https_proxy}",
+    "no_proxy":    "${localEnv:no_proxy}"
+  },
+
+  // Order matters:
+  //   1. seed ~/.claude from host bind mount (selective copy, fresh per rebuild)
+  //   2. raise firewall (smoke test runs inside the script)
+  //   3. composer install (works either via proxy or via direct allowlist)
+  // Seed only the entries the container actually needs: global instructions,
+  // auth, settings, installed plugins/skills, and hooks. Everything else under
+  // host ~/.claude (per-project sessions, caches, file-history, todos, etc.)
+  // is ephemeral and would just bloat the container with stale state.
+  // Note: `cp -r --preserve=mode,timestamps` (not `cp -a`) so the destination
+  // is owned by the running user (vscode); chown is not needed and would
+  // require widening the scoped sudoers entry.
+  "postCreateCommand": "bash -lc 'mkdir -p /home/vscode/.claude && if [ -d /home/vscode/.claude-host ]; then for e in CLAUDE.md .credentials.json settings.json plugins hooks; do if [ -e \"/home/vscode/.claude-host/$e\" ]; then cp -r --preserve=mode,timestamps \"/home/vscode/.claude-host/$e\" /home/vscode/.claude/; fi; done; fi && sudo /usr/local/bin/init-firewall.sh && composer install'",
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "bmewburn.vscode-intelephense-client",
+        "xdebug.php-debug",
+        "recca0120.vscode-phpunit",
+        "anthropic.claude-code"
+      ]
+    }
+  }
+}

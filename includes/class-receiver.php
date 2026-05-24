@@ -1,0 +1,868 @@
+<?php
+
+if (!defined('ABSPATH')) {
+    exit;
+}
+
+class Fylgja_Receiver {
+
+    private Fylgja_Auth $auth;
+    private Fylgja_Sync_Log $log;
+    private Fylgja_Wpml_Mapper $mapper;
+
+    public function __construct(Fylgja_Auth $auth, ?Fylgja_Sync_Log $log = null, ?Fylgja_Wpml_Mapper $mapper = null) {
+        $this->auth = $auth;
+        $this->log  = $log ?? new Fylgja_Sync_Log();
+        $this->mapper = $mapper ?? new Fylgja_Wpml_Mapper(
+            new Fylgja_Trid_Map(),
+            new Fylgja_Lookup()
+        );
+    }
+
+    public function register_routes(): void {
+        add_action('rest_api_init', function () {
+            register_rest_route('fylgja-wp-sync/v1', '/receive', [
+                'methods'             => 'POST',
+                'callback'            => [$this, 'handle_receive'],
+                'permission_callback' => [$this->auth, 'permission_check'],
+            ]);
+
+            register_rest_route('fylgja-wp-sync/v1', '/receive-batch', [
+                'methods'             => 'POST',
+                'callback'            => [$this, 'handle_receive_batch'],
+                'permission_callback' => [$this->auth, 'permission_check'],
+            ]);
+
+            register_rest_route('fylgja-wp-sync/v1', '/health', [
+                'methods'             => 'GET',
+                'callback'            => [$this, 'handle_health'],
+                'permission_callback' => [$this->auth, 'permission_check'],
+            ]);
+        });
+    }
+
+    public function handle_health(WP_REST_Request $request): WP_REST_Response {
+        return new WP_REST_Response([
+            'mode'        => get_option('fylgja_slave_mode', 'active'),
+            'version'     => defined('FYLGJA_VERSION') ? FYLGJA_VERSION : 'unknown',
+            'wpml_active' => $this->is_wpml_active(),
+        ], 200);
+    }
+
+    private function is_wpml_active(): bool {
+        return defined('ICL_SITEPRESS_VERSION') || function_exists('wpml_get_active_languages_filter');
+    }
+
+    public function handle_receive(WP_REST_Request $request): WP_REST_Response {
+        $body = $request->get_json_params();
+
+        $action      = sanitize_text_field($body['action'] ?? '');
+        $object_type = sanitize_text_field($body['object_type'] ?? '');
+        $payload     = $body['payload'] ?? [];
+
+        $version_check = $this->check_payload_version($payload);
+        if ($version_check !== null) {
+            return $version_check;
+        }
+
+        if (empty($action) || empty($object_type) || empty($payload)) {
+            return new WP_REST_Response(['error' => 'Missing required fields'], 400);
+        }
+
+        $preview = $this->compute_preview($action, $object_type, $payload);
+        $log_id  = $this->log->insert($action, $object_type, $payload, $preview);
+
+        if (get_option('fylgja_slave_mode', 'active') === 'inspect') {
+            return new WP_REST_Response(
+                ['mode' => 'inspect', 'log_id' => $log_id, 'preview' => $preview],
+                200
+            );
+        }
+
+        $result = $this->apply_preview($preview);
+        $this->log->mark_applied($log_id, $result);
+        return new WP_REST_Response($result, $result['success'] ? 200 : 500);
+    }
+
+    public function handle_receive_batch(WP_REST_Request $request): WP_REST_Response {
+        $items   = $request->get_json_params()['items'] ?? [];
+        $results = [];
+
+        foreach ($items as $item) {
+            $action      = sanitize_text_field($item['action'] ?? '');
+            $object_type = sanitize_text_field($item['object_type'] ?? '');
+            $payload     = $item['payload'] ?? [];
+
+            $version_check = $this->check_payload_version($payload);
+            if ($version_check !== null) {
+                $results[] = ['success' => false, 'error' => 'Unsupported payload_version'];
+                continue;
+            }
+
+            $preview = $this->compute_preview($action, $object_type, $payload);
+            $log_id  = $this->log->insert($action, $object_type, $payload, $preview);
+
+            if (get_option('fylgja_slave_mode', 'active') === 'inspect') {
+                $results[] = ['mode' => 'inspect', 'log_id' => $log_id];
+                continue;
+            }
+
+            $result = $this->apply_preview($preview);
+            $this->log->mark_applied($log_id, $result);
+            $results[] = $result;
+        }
+
+        return new WP_REST_Response(['results' => $results], 200);
+    }
+
+    private function check_payload_version(array $payload): ?WP_REST_Response {
+        $payload_version = (int) ($payload['payload_version'] ?? 0);
+        if ($payload_version < 2) {
+            return new WP_REST_Response(
+                ['error' => "Unsupported payload_version: {$payload_version}. Slave requires >= 2."],
+                400
+            );
+        }
+        return null;
+    }
+
+    /**
+     * Pure: builds a preview describing what would happen, without writes.
+     */
+    public function compute_preview(string $action, string $object_type, array $payload): array {
+        $base = [
+            'object_type' => $object_type,
+            'action'      => $action,
+            'source_id'   => (int) ($payload['source_id'] ?? 0),
+            'payload'     => $payload,
+            'warnings'    => [],
+        ];
+
+        switch ($object_type) {
+            case 'post':
+                return $this->preview_post($action, $payload, $base);
+            case 'attachment':
+                return $this->preview_attachment($action, $payload, $base);
+            case 'term':
+                return $this->preview_term($action, $payload, $base);
+            case 'string':
+                return $this->preview_string($action, $payload, $base);
+            default:
+                $base['warnings'][] = "Unknown object_type: {$object_type}";
+                $base['would_apply'] = false;
+                return $base;
+        }
+    }
+
+    /**
+     * Performs the writes described by a preview.
+     */
+    public function apply_preview(array $preview): array {
+        switch ($preview['object_type']) {
+            case 'post':
+                $result = $this->apply_post_preview($preview);
+                break;
+            case 'attachment':
+                $result = $this->apply_attachment_preview($preview);
+                break;
+            case 'term':
+                $result = $this->apply_term_preview($preview);
+                break;
+            case 'string':
+                $result = $this->apply_string_preview($preview);
+                break;
+            default:
+                return ['success' => false, 'error' => "Cannot apply unknown object_type: {$preview['object_type']}"];
+        }
+
+        if (!empty($result['success'])) {
+            $this->sweep_deferred_refs();
+        }
+
+        return $result;
+    }
+
+    public function run_deferred_sweep(): void {
+        $this->sweep_deferred_refs();
+    }
+
+    private function sweep_deferred_refs(): void {
+        $storage = new Fylgja_Deferred_Refs();
+        $lookup  = new Fylgja_Lookup();
+        $rows    = $storage->pending_for_types_like(['term:%', 'post:%'], 500);
+
+        foreach ($rows as $row) {
+            $local_id = $this->resolve_deferred_target($row, $lookup);
+            if ($local_id === null) {
+                continue;
+            }
+            if ($this->apply_deferred_resolution($row, $local_id)) {
+                $storage->delete((int) $row->id);
+            }
+        }
+    }
+
+    private function resolve_deferred_target(object $row, Fylgja_Lookup $lookup): ?int {
+        if (str_starts_with($row->ref_object_type, 'term:')) {
+            $taxonomy = substr($row->ref_object_type, 5);
+            return $lookup->find_term_by_source_id((int) $row->ref_source_id, $taxonomy);
+        }
+        if (str_starts_with($row->ref_object_type, 'post:')) {
+            return $lookup->find_post_by_source_id((int) $row->ref_source_id);
+        }
+        return null;
+    }
+
+    private function apply_deferred_resolution(object $row, int $resolved_local_id): bool {
+        if ($row->ref_type === 'post_term_assignment') {
+            $taxonomy = substr($row->ref_object_type, 5);
+            wp_set_object_terms((int) $row->dependent_local_id, [$resolved_local_id], $taxonomy, true);
+            return true;
+        }
+        if ($row->ref_type === 'menu_item_object') {
+            update_post_meta((int) $row->dependent_local_id, '_menu_item_object_id', $resolved_local_id);
+            wp_update_post(['ID' => (int) $row->dependent_local_id, 'post_status' => 'publish']);
+            return true;
+        }
+        if ($row->ref_type === 'term_parent') {
+            $hint     = $row->payload_hint ? json_decode($row->payload_hint, true) : [];
+            $taxonomy = $hint['taxonomy'] ?? null;
+            if (!$taxonomy) return false;
+            wp_update_term((int) $row->dependent_local_id, $taxonomy, ['parent' => $resolved_local_id]);
+            return true;
+        }
+        return false;
+    }
+
+    private function preview_post(string $action, array $payload, array $base): array {
+        $source_id = $base['source_id'];
+
+        if ($action === 'delete') {
+            $local_id = $this->find_local_post($source_id);
+            $base['would_delete']   = $local_id !== null;
+            $base['local_id']       = $local_id;
+            return $base;
+        }
+
+        $local_id = $this->find_local_post($source_id);
+        $base['local_id']        = $local_id;
+        $base['would_create']    = $local_id === null;
+
+        $wpml_block = $payload['wpml'] ?? [];
+        $element_type = $wpml_block['element_type'] ?? ('post_' . ($payload['post_type'] ?? 'post'));
+        $base['wpml_plan']    = $this->mapper->plan($element_type, $wpml_block, $local_id);
+        $base['element_type'] = $element_type;
+        if (!empty($base['wpml_plan']['warnings'])) {
+            $base['warnings'] = array_merge($base['warnings'], $base['wpml_plan']['warnings']);
+        }
+
+        return $base;
+    }
+
+    private function preview_attachment(string $action, array $payload, array $base): array {
+        $source_id  = $base['source_id'];
+        $source_url = $payload['source_url'] ?? '';
+
+        if ($action === 'delete') {
+            $local_id = $this->find_local_post($source_id);
+            $base['would_delete'] = $local_id !== null;
+            $base['local_id']     = $local_id;
+            return $base;
+        }
+
+        $local_id = $this->find_local_post($source_id);
+        $base['local_id']     = $local_id;
+        $base['would_create'] = $local_id === null;
+        $base['source_url']   = $source_url;
+        if (empty($source_url)) {
+            $base['warnings'][] = 'Missing source_url for attachment';
+        }
+        $wpml_block = $payload['wpml'] ?? [];
+        $element_type = $wpml_block['element_type'] ?? ('post_' . ($payload['post_type'] ?? 'attachment'));
+        $base['wpml_plan']    = $this->mapper->plan($element_type, $wpml_block, $local_id);
+        $base['element_type'] = $element_type;
+        if (!empty($base['wpml_plan']['warnings'])) {
+            $base['warnings'] = array_merge($base['warnings'], $base['wpml_plan']['warnings']);
+        }
+        return $base;
+    }
+
+    private function preview_term(string $action, array $payload, array $base): array {
+        $source_id = $base['source_id'];
+        $taxonomy  = $payload['taxonomy'] ?? '';
+        $lookup    = new Fylgja_Lookup();
+
+        $local_id = $taxonomy ? $lookup->find_term_by_source_id($source_id, $taxonomy) : null;
+
+        if ($action === 'delete') {
+            $base['would_delete'] = $local_id !== null;
+            $base['local_id']     = $local_id;
+            return $base;
+        }
+
+        $base['local_id']     = $local_id;
+        $base['would_create'] = $local_id === null;
+
+        $wpml_block = $payload['wpml'] ?? [];
+        $element_type = $wpml_block['element_type'] ?? ('tax_' . $taxonomy);
+        $base['wpml_plan']    = $this->mapper->plan($element_type, $wpml_block, $local_id);
+        $base['element_type'] = $element_type;
+        if (!empty($base['wpml_plan']['warnings'])) {
+            $base['warnings'] = array_merge($base['warnings'], $base['wpml_plan']['warnings']);
+        }
+
+        return $base;
+    }
+
+    private function apply_term_preview(array $preview): array {
+        $action    = $preview['action'];
+        $payload   = $preview['payload'];
+        $source_id = $preview['source_id'];
+        $taxonomy  = $payload['taxonomy'] ?? '';
+
+        if (!$taxonomy || !taxonomy_exists($taxonomy)) {
+            return ['success' => false, 'error' => "Unknown taxonomy: {$taxonomy}"];
+        }
+
+        $lookup = new Fylgja_Lookup();
+
+        if ($action === 'delete') {
+            $local_term_id = $lookup->find_term_by_source_id($source_id, $taxonomy);
+            if (!$local_term_id) {
+                return ['success' => true, 'message' => 'Already deleted or not found'];
+            }
+            $result = wp_delete_term($local_term_id, $taxonomy);
+            if (is_wp_error($result) || $result === false) {
+                return ['success' => false, 'error' => 'wp_delete_term failed'];
+            }
+            return ['success' => true, 'deleted_local_id' => $local_term_id];
+        }
+
+        $local_id = $preview['local_id'] ?? $lookup->find_term_by_source_id($source_id, $taxonomy);
+
+        // Clone-slave adoption: a slave cloned from the master already holds these
+        // terms but without a _fylgja_source_id stamp, so the source-id lookup
+        // misses and resync would insert a duplicate. Match the pre-existing term
+        // by WPML language + slug and adopt it (the stamp below claims it). The
+        // language scoping is what makes this safe — a slug-only match was reverted
+        // earlier because it could adopt the wrong-language sibling and corrupt it.
+        if (!$local_id) {
+            $local_id = $this->adopt_unstamped_term(
+                $taxonomy,
+                $payload['wpml']['language_code'] ?? null,
+                sanitize_title($payload['slug'] ?? '')
+            );
+        }
+
+        $parent_local_id = 0;
+        $parent_source_id = (int) ($payload['parent_source_id'] ?? 0);
+        $needs_deferred_parent = false;
+        if ($parent_source_id > 0) {
+            $resolved_parent = $lookup->find_term_by_source_id($parent_source_id, $taxonomy);
+            if ($resolved_parent) {
+                $parent_local_id = $resolved_parent;
+            } else {
+                $needs_deferred_parent = true;
+            }
+        }
+
+        $target_lang = $preview['wpml_plan']['language_code'] ?? null;
+        $slug_base   = ($payload['slug'] ?? '') !== '' ? $payload['slug'] : ($payload['name'] ?? '');
+        $description = wp_kses_post($payload['description'] ?? '');
+
+        // Run inserts AND updates under the term's own language. WPML's get_term
+        // filter (get_term_adjust_id) rewrites the id returned by get_term_by to
+        // the *current-language* sibling of the trid group. wp_update_term's
+        // duplicate-slug check (get_term_by('slug',...) !== term_id) then compares
+        // against the wrong sibling and raises a phantom duplicate_term_slug. WPML
+        // disables that adjustment while wp_update_term is on the stack, but the
+        // guard only scans ~19 backtrace frames and our REST/resync stack is deeper,
+        // so the guard misses. Switching to the target language makes the adjustment
+        // a no-op (the term resolves to itself) — mirroring WPML_Update_Term_Action.
+        $switch_lang = $target_lang && ($preview['wpml_plan']['trid_action'] ?? 'none') !== 'none';
+        if ($switch_lang) {
+            $prev_lang = apply_filters('wpml_current_language', null);
+            do_action('wpml_switch_language', $target_lang);
+        }
+        try {
+            if ($local_id) {
+                $args = [
+                    'slug'        => $this->resolve_term_slug($slug_base, $taxonomy, $target_lang, $local_id),
+                    'description' => $description,
+                    'parent'      => $parent_local_id,
+                ];
+                $result = wp_update_term($local_id, $taxonomy, ['name' => $payload['name']] + $args);
+            } else {
+                $args = [
+                    'slug'        => $this->resolve_term_slug($slug_base, $taxonomy, $target_lang, 0),
+                    'description' => $description,
+                    'parent'      => $parent_local_id,
+                ];
+                $result = wp_insert_term($payload['name'], $taxonomy, $args);
+                if (is_wp_error($result)) {
+                    // Adopt an existing same-identity term instead of failing. An install
+                    // synced before source-id stamping was reliable can already hold this
+                    // term under a different/absent _fylgja_source_id, so the insert
+                    // collides (term_exists). Update it in place; the source-id stamp
+                    // below then claims it for future lookups.
+                    $existing_id = $this->existing_term_id_from_error($result);
+                    if ($existing_id > 0) {
+                        $local_id = $existing_id;
+                        $args['slug'] = $this->resolve_term_slug($slug_base, $taxonomy, $target_lang, $existing_id);
+                        $result = wp_update_term($local_id, $taxonomy, ['name' => $payload['name']] + $args);
+                    }
+                }
+            }
+        } finally {
+            if ($switch_lang) {
+                do_action('wpml_switch_language', $prev_lang);
+            }
+        }
+
+        if (is_wp_error($result)) {
+            return ['success' => false, 'error' => $result->get_error_message()];
+        }
+
+        $local_id = (int) ($result['term_id'] ?? $local_id);
+        update_term_meta($local_id, '_fylgja_source_id', $source_id);
+
+        if (!empty($payload['meta'])) {
+            foreach ($payload['meta'] as $key => $value) {
+                if (str_starts_with($key, '_fylgja_') || str_starts_with($key, '_wpml_') || $key === '_icl_translation_id') {
+                    continue;
+                }
+                update_term_meta($local_id, $key, $value);
+            }
+        }
+
+        if (!empty($preview['wpml_plan']) && $preview['wpml_plan']['trid_action'] !== 'none') {
+            $plan_with_source = $preview['wpml_plan'];
+            $plan_with_source['source_trid'] = (int) ($payload['wpml']['source_trid'] ?? 0);
+            // WPML keys term translations on term_taxonomy_id, not term_id.
+            $local_term = get_term($local_id, $taxonomy);
+            if ($local_term && !is_wp_error($local_term)) {
+                $this->mapper->attach((int) $local_term->term_taxonomy_id, $preview['element_type'], $plan_with_source);
+            }
+        }
+
+        if ($needs_deferred_parent) {
+            (new Fylgja_Deferred_Refs())->insert(
+                'term_parent',
+                $local_id,
+                "term:{$taxonomy}",
+                $parent_source_id,
+                ['taxonomy' => $taxonomy]
+            );
+        }
+
+        return ['success' => true, 'local_id' => $local_id, 'source_id' => $source_id];
+    }
+
+    /**
+     * Resolves the existing local term id from a wp_insert_term collision so the
+     * caller can adopt it. Only WP's `term_exists` error is safe to act on — it
+     * carries the colliding term id as its error data, and that term is the same
+     * one we meant to write. Slug-conflict errors are NOT handled here: they fire
+     * for cross-language translation slug clashes, where the slug-matching term is
+     * the wrong-language sibling and adopting it would corrupt it (see the open
+     * translation-slug follow-up).
+     */
+    private function existing_term_id_from_error(WP_Error $error): int {
+        $data = $error->get_error_data();
+        if (is_numeric($data) && (int) $data > 0) {
+            return (int) $data;
+        }
+        if (is_array($data) && !empty($data['term_id'])) {
+            return (int) $data['term_id'];
+        }
+        return 0;
+    }
+
+    /**
+     * Picks a slug that is unique among *other* terms in the taxonomy.
+     *
+     * The master may carry duplicate slugs across a term and its WPML
+     * translations (the WPML category editor sets no slug, and migrated data can
+     * share one). WP core's wp_update_term rejects any slug already owned by
+     * another term with `duplicate_term_slug`, and WPML does not language-scope
+     * that check outside a real wp-admin request — so we resolve the slug here
+     * rather than relying on core/WPML to do it.
+     *
+     * Priority: (1) keep the term's current slug if still unique — so repeated
+     * resyncs don't churn it and the default-language term keeps its bare slug;
+     * (2) the source slug if free; (3) for non-default languages, `slug-{lang}`
+     * (mirrors WPML's native scheme); (4) a numeric suffix.
+     */
+    private function resolve_term_slug(string $base, string $taxonomy, ?string $target_lang, int $exclude_term_id): string {
+        $base = sanitize_title($base);
+        if ($base === '') {
+            return $base;
+        }
+
+        if ($exclude_term_id > 0) {
+            $current = $this->current_term_slug($exclude_term_id);
+            if ($current !== null && $current !== '' && !$this->term_slug_taken($current, $taxonomy, $exclude_term_id)) {
+                return $current;
+            }
+        }
+
+        if (!$this->term_slug_taken($base, $taxonomy, $exclude_term_id)) {
+            return $base;
+        }
+
+        $default_lang = (string) apply_filters('wpml_default_language', null);
+        $candidate    = $base;
+        if ($target_lang && $default_lang && $target_lang !== $default_lang) {
+            $lang_slug = $base . '-' . $target_lang;
+            if (!$this->term_slug_taken($lang_slug, $taxonomy, $exclude_term_id)) {
+                return $lang_slug;
+            }
+            $candidate = $lang_slug;
+        }
+
+        $i = 2;
+        while ($this->term_slug_taken($candidate . '-' . $i, $taxonomy, $exclude_term_id)) {
+            $i++;
+        }
+        return $candidate . '-' . $i;
+    }
+
+    /**
+     * Finds a pre-existing, unstamped slave term to adopt during sync, matched by
+     * taxonomy + WPML language + slug. Used when the _fylgja_source_id lookup
+     * misses on a slave cloned from the master. Language-scoped so it never picks
+     * a wrong-language sibling; the meta_id IS NULL guard prevents hijacking a term
+     * already mapped to another source id.
+     */
+    private function adopt_unstamped_term(string $taxonomy, ?string $language_code, string $slug): ?int {
+        if (!$language_code || $slug === '' || !$this->is_wpml_active()) {
+            return null;
+        }
+        global $wpdb;
+        $term_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT t.term_id
+             FROM {$wpdb->terms} t
+             JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = t.term_id
+             JOIN {$wpdb->prefix}icl_translations tr
+                  ON tr.element_id = tt.term_taxonomy_id
+                 AND tr.element_type = %s
+             LEFT JOIN {$wpdb->termmeta} tm
+                  ON tm.term_id = t.term_id AND tm.meta_key = '_fylgja_source_id'
+             WHERE tt.taxonomy = %s
+               AND tr.language_code = %s
+               AND t.slug = %s
+               AND tm.meta_id IS NULL
+             LIMIT 1",
+            'tax_' . $taxonomy,
+            $taxonomy,
+            $language_code,
+            $slug
+        ));
+        return $term_id === null ? null : (int) $term_id;
+    }
+
+    private function current_term_slug(int $term_id): ?string {
+        global $wpdb;
+        $slug = $wpdb->get_var($wpdb->prepare(
+            "SELECT slug FROM {$wpdb->terms} WHERE term_id = %d LIMIT 1",
+            $term_id
+        ));
+        return $slug === null ? null : (string) $slug;
+    }
+
+    private function term_slug_taken(string $slug, string $taxonomy, int $exclude_term_id): bool {
+        global $wpdb;
+        $id = $wpdb->get_var($wpdb->prepare(
+            "SELECT t.term_id FROM {$wpdb->terms} t
+             JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = t.term_id
+             WHERE t.slug = %s AND tt.taxonomy = %s AND t.term_id != %d
+             LIMIT 1",
+            $slug,
+            $taxonomy,
+            $exclude_term_id
+        ));
+        return $id !== null;
+    }
+
+    private function preview_string(string $action, array $payload, array $base): array {
+        $identity_hash = md5(
+            ($payload['context'] ?? '')
+            . ($payload['name'] ?? '')
+            . ($payload['gettext_context'] ?? '')
+        );
+        $base['identity_md5']       = $identity_hash;
+        $base['local_string_id']    = $this->find_local_string_id($identity_hash);
+        $base['would_create']       = $base['local_string_id'] === null;
+        $base['translations_count'] = count($payload['translations'] ?? []);
+        return $base;
+    }
+
+    private function find_local_string_id(string $md5): ?int {
+        global $wpdb;
+        $row = $wpdb->get_var($wpdb->prepare(
+            "SELECT id FROM {$wpdb->prefix}icl_strings WHERE domain_name_context_md5 = %s LIMIT 1",
+            $md5
+        ));
+        return $row === null ? null : (int) $row;
+    }
+
+    private function apply_string_preview(array $preview): array {
+        global $wpdb;
+        $payload = $preview['payload'];
+        $local_string_id = $preview['local_string_id'] ?? null;
+
+        $string_data = [
+            'value'       => $payload['value'] ?? '',
+            'status'      => (int) ($payload['status'] ?? 0),
+            'string_type' => (int) ($payload['string_type'] ?? 0),
+            'wrap_tag'    => $payload['wrap_tag'] ?? '',
+        ];
+
+        if ($local_string_id) {
+            $wpdb->update("{$wpdb->prefix}icl_strings", $string_data, ['id' => $local_string_id]);
+        } else {
+            $wpdb->insert("{$wpdb->prefix}icl_strings", $string_data + [
+                'language'                => 'en',
+                'context'                 => $payload['context'] ?? '',
+                'name'                    => $payload['name'] ?? '',
+                'gettext_context'         => $payload['gettext_context'] ?? '',
+                'domain_name_context_md5' => $preview['identity_md5'],
+                'translation_priority'    => '',
+            ]);
+            $local_string_id = (int) $wpdb->insert_id;
+        }
+
+        foreach (($payload['translations'] ?? []) as $lang => $t) {
+            $wpdb->query($wpdb->prepare(
+                "INSERT INTO {$wpdb->prefix}icl_string_translations (string_id, language, status, value)
+                 VALUES (%d, %s, %d, %s)
+                 ON DUPLICATE KEY UPDATE status = VALUES(status), value = VALUES(value)",
+                $local_string_id,
+                $lang,
+                (int) ($t['status'] ?? 10),
+                $t['value'] ?? ''
+            ));
+        }
+
+        return ['success' => true, 'local_id' => $local_string_id, 'source_id' => $preview['source_id']];
+    }
+
+    private function apply_post_preview(array $preview): array {
+        $action  = $preview['action'];
+        $payload = $preview['payload'];
+        $source_id = $preview['source_id'];
+
+        if ($action === 'delete') {
+            return $this->delete_synced_post($source_id);
+        }
+
+        $local_id = $preview['local_id'];
+
+        $post_data = [
+            'post_title'   => sanitize_text_field($payload['post_title'] ?? ''),
+            'post_content' => wp_kses_post($payload['post_content'] ?? ''),
+            'post_status'  => sanitize_text_field($payload['post_status'] ?? 'publish'),
+            'post_type'    => sanitize_text_field($payload['post_type'] ?? 'post'),
+            'post_name'    => sanitize_title($payload['post_name'] ?? ''),
+            'post_excerpt' => wp_kses_post($payload['post_excerpt'] ?? ''),
+            'menu_order'   => (int) ($payload['menu_order'] ?? 0),
+        ];
+
+        if ($local_id) {
+            $post_data['ID'] = $local_id;
+            $result_id = wp_update_post($post_data, true);
+        } else {
+            $result_id = wp_insert_post($post_data, true);
+        }
+
+        if (is_wp_error($result_id)) {
+            return ['success' => false, 'error' => $result_id->get_error_message()];
+        }
+
+        update_post_meta($result_id, '_fylgja_source_id', $source_id);
+
+        // Attach WPML language/trid if WPML is active and payload includes the block.
+        if (!empty($preview['wpml_plan']) && $preview['wpml_plan']['trid_action'] !== 'none') {
+            $plan_with_source = $preview['wpml_plan'];
+            $plan_with_source['source_trid'] = (int) ($payload['wpml']['source_trid'] ?? 0);
+            $this->mapper->attach($result_id, $preview['element_type'], $plan_with_source);
+        }
+
+        if (!empty($payload['meta'])) {
+            $this->sync_post_meta($result_id, $payload['meta']);
+        }
+
+        if (!empty($payload['terms'])) {
+            $this->sync_post_terms($result_id, $payload['terms']);
+        }
+
+        if (($payload['post_type'] ?? '') === 'nav_menu_item') {
+            $this->rewrite_menu_item_object($result_id);
+        }
+
+        return ['success' => true, 'local_id' => $result_id, 'source_id' => $source_id];
+    }
+
+    private function rewrite_menu_item_object(int $local_id): void {
+        $menu_item_object = get_post_meta($local_id, '_menu_item_object', true);
+        $source_object_id = (int) get_post_meta($local_id, '_menu_item_object_id', true);
+
+        // 'custom' resolves by URL; 'post_type_archive' resolves by post-type slug and
+        // carries a 0/negative sentinel object id. Neither has a real object to remap —
+        // leave them published, never defer. (A real post/term ref is always > 0.)
+        if ($menu_item_object === 'custom' || $source_object_id <= 0) {
+            return;
+        }
+
+        $lookup = new Fylgja_Lookup();
+        $type   = get_post_meta($local_id, '_menu_item_type', true);
+        $local_object_id = null;
+
+        if ($type === 'taxonomy') {
+            $local_object_id = $lookup->find_term_by_source_id($source_object_id, $menu_item_object);
+        } elseif ($type === 'post_type' || $type === '') {
+            $local_object_id = $lookup->find_post_by_source_id($source_object_id);
+        }
+
+        if ($local_object_id) {
+            update_post_meta($local_id, '_menu_item_object_id', $local_object_id);
+            if (get_post_status($local_id) === 'draft') {
+                wp_update_post(['ID' => $local_id, 'post_status' => 'publish']);
+            }
+            return;
+        }
+
+        wp_update_post(['ID' => $local_id, 'post_status' => 'draft']);
+        $ref_object_type = $type === 'taxonomy'
+            ? "term:{$menu_item_object}"
+            : "post:{$menu_item_object}";
+        (new Fylgja_Deferred_Refs())->insert(
+            'menu_item_object',
+            $local_id,
+            $ref_object_type,
+            $source_object_id
+        );
+    }
+
+    private function apply_attachment_preview(array $preview): array {
+        $action  = $preview['action'];
+        $payload = $preview['payload'];
+        $source_id  = $preview['source_id'];
+        $source_url = $preview['source_url'] ?? '';
+
+        if ($action === 'delete') {
+            return $this->delete_synced_post($source_id);
+        }
+
+        if (empty($source_url)) {
+            return ['success' => false, 'error' => 'Missing source_url for attachment'];
+        }
+
+        $local_id = $preview['local_id'];
+
+        if (!$local_id) {
+            require_once ABSPATH . 'wp-admin/includes/media.php';
+            require_once ABSPATH . 'wp-admin/includes/file.php';
+            require_once ABSPATH . 'wp-admin/includes/image.php';
+
+            $tmp = download_url($source_url);
+            if (is_wp_error($tmp)) {
+                return ['success' => false, 'error' => $tmp->get_error_message()];
+            }
+
+            $file_array = [
+                'name'     => basename(wp_parse_url($source_url, PHP_URL_PATH)),
+                'tmp_name' => $tmp,
+            ];
+
+            $attachment_id = media_handle_sideload($file_array, 0);
+            if (is_wp_error($attachment_id)) {
+                @unlink($tmp);
+                return ['success' => false, 'error' => $attachment_id->get_error_message()];
+            }
+
+            update_post_meta($attachment_id, '_fylgja_source_id', $source_id);
+            $local_id = $attachment_id;
+        }
+
+        // Attach WPML language/trid if WPML is active and payload includes the block.
+        if (!empty($preview['wpml_plan']) && $preview['wpml_plan']['trid_action'] !== 'none') {
+            $plan_with_source = $preview['wpml_plan'];
+            $plan_with_source['source_trid'] = (int) ($payload['wpml']['source_trid'] ?? 0);
+            $this->mapper->attach($local_id, $preview['element_type'], $plan_with_source);
+        }
+
+        if (!empty($payload['meta'])) {
+            $this->sync_post_meta($local_id, $payload['meta']);
+        }
+
+        return ['success' => true, 'local_id' => $local_id, 'source_id' => $source_id];
+    }
+
+    private function find_local_post(int $source_id): ?int {
+        // Direct postmeta lookup — must match ALL post types. get_posts('any')
+        // silently excludes attachments and any CPT registered with
+        // exclude_from_search=true, which made re-syncs of those types insert
+        // duplicates instead of updating in place.
+        return (new Fylgja_Lookup())->find_post_by_source_id($source_id);
+    }
+
+    private function delete_synced_post(int $source_id): array {
+        $local_id = $this->find_local_post($source_id);
+        if (!$local_id) {
+            return ['success' => true, 'message' => 'Already deleted or not found'];
+        }
+        $deleted = wp_delete_post($local_id, true);
+        if (!$deleted) {
+            return ['success' => false, 'error' => "Failed to delete local post {$local_id}"];
+        }
+        return ['success' => true, 'deleted_local_id' => $local_id];
+    }
+
+    private function sync_post_meta(int $post_id, array $meta): void {
+        foreach ($meta as $key => $value) {
+            if (str_starts_with($key, '_fylgja_')
+                || str_starts_with($key, '_wp_')
+                || str_starts_with($key, '_edit_')
+                || $key === '_pingme'
+            ) {
+                continue;
+            }
+            update_post_meta($post_id, $key, $value);
+        }
+    }
+
+    private function sync_post_terms(int $post_id, array $terms_by_taxonomy): void {
+        $lookup   = new Fylgja_Lookup();
+        $deferred = new Fylgja_Deferred_Refs();
+
+        foreach ($terms_by_taxonomy as $taxonomy => $source_term_ids) {
+            if (!taxonomy_exists($taxonomy)) {
+                continue;
+            }
+
+            $local_term_ids = [];
+            $unresolved     = [];
+
+            foreach ($source_term_ids as $source_term_id) {
+                $local_term_id = $lookup->find_term_by_source_id((int) $source_term_id, $taxonomy);
+                if ($local_term_id) {
+                    $local_term_ids[] = $local_term_id;
+                } else {
+                    $unresolved[] = (int) $source_term_id;
+                }
+            }
+
+            wp_set_object_terms($post_id, $local_term_ids, $taxonomy);
+
+            foreach ($unresolved as $source_term_id) {
+                $deferred->insert(
+                    'post_term_assignment',
+                    $post_id,
+                    "term:{$taxonomy}",
+                    $source_term_id
+                );
+            }
+        }
+    }
+}

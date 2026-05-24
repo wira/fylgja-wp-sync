@@ -1,0 +1,13 @@
+.idea/
+*.log
+node_modules/
+.DS_Store
+/vendor/
+/.phpunit.cache/
+/.phpunit.result.cache
+composer.lock
+
+# Internal planning/specs and local scratch — not part of the published plugin
+/docs/superpowers/
+/db-query.md
+/wpml/

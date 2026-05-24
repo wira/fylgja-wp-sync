@@ -1,0 +1,26 @@
+.fylgja-queue-table {
+    max-width: 400px;
+    margin-bottom: 16px;
+}
+
+.fylgja-queue-table th,
+.fylgja-queue-table td {
+    text-align: center;
+}
+
+#fylgja-sync-status {
+    margin-left: 10px;
+    font-style: italic;
+}
+
+#fylgja-log-table pre {
+    white-space: pre-wrap;
+    word-break: break-all;
+    max-height: 300px;
+    overflow: auto;
+    background: #f6f7f7;
+    padding: 8px;
+}
+.fylgja-log-detail {
+    background: #fafafa;
+}
