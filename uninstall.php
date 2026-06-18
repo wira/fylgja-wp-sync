@@ -30,6 +30,7 @@ $options = [
     'fylgja_slave_mode',
     'fylgja_string_hashes',
     'fylgja_resync_state',
+    'fylgja_resync_batch_size',
 ];
 foreach ($options as $option) {
     delete_option($option);

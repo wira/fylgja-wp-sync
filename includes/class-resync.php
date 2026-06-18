@@ -7,7 +7,7 @@ if (!defined('ABSPATH')) {
 class Fylgja_Resync {
 
     private const OPTION = 'fylgja_resync_state';
-    private const BATCH  = 200;
+    private const BATCH  = 25;
     private const PHASES = ['terms', 'posts', 'strings'];
 
     private Fylgja_Queue $queue;
@@ -68,7 +68,8 @@ class Fylgja_Resync {
             return ['ok' => false, 'error' => 'not_running'];
         }
 
-        $batch_size = (int) apply_filters('fylgja_resync_batch_size', self::BATCH);
+        $batch_default = (int) get_option('fylgja_resync_batch_size', self::BATCH);
+        $batch_size    = (int) apply_filters('fylgja_resync_batch_size', $batch_default);
 
         switch ($state['phase']) {
             case 'terms':

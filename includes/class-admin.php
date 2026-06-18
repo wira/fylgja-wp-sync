@@ -75,6 +75,11 @@ class Fylgja_Admin {
         register_setting('fylgja_settings', 'fylgja_slave_mode', [
             'sanitize_callback' => [$this, 'sanitize_slave_mode'],
         ]);
+        register_setting('fylgja_settings', 'fylgja_resync_batch_size', [
+            'type'              => 'integer',
+            'default'           => 25,
+            'sanitize_callback' => [$this, 'sanitize_resync_batch_size'],
+        ]);
     }
 
     public function sanitize_role($value): string {
@@ -85,10 +90,18 @@ class Fylgja_Admin {
         return in_array($value, ['active', 'inspect'], true) ? $value : 'active';
     }
 
+    public function sanitize_resync_batch_size($value): int {
+        if (!is_numeric($value)) {
+            return 25;
+        }
+        return max(1, min(100, (int) $value));
+    }
+
     public function render_page(): void {
-        $role       = get_option('fylgja_role', 'disabled');
-        $remote_url = get_option('fylgja_remote_url', '');
-        $api_key    = get_option('fylgja_api_key', '');
+        $role              = get_option('fylgja_role', 'disabled');
+        $remote_url        = get_option('fylgja_remote_url', '');
+        $api_key           = get_option('fylgja_api_key', '');
+        $resync_batch_size = (int) get_option('fylgja_resync_batch_size', 25);
         $queue      = new Fylgja_Queue();
         $counts     = $queue->get_counts();
         ?>
@@ -146,6 +159,21 @@ class Fylgja_Admin {
                             </p>
                         </td>
                     </tr>
+                    <?php if ($role === 'master') : ?>
+                    <tr>
+                        <th scope="row">Resync Batch Size</th>
+                        <td>
+                            <input type="number" name="fylgja_resync_batch_size" id="fylgja_resync_batch_size"
+                                   value="<?php echo esc_attr($resync_batch_size); ?>" class="small-text"
+                                   min="1" max="100" step="1" />
+                            <p class="description">
+                                Number of terms/posts/strings pushed per background batch during
+                                &ldquo;Resync All&rdquo;. Range 1&ndash;100; default 25.
+                                Only used when Role = Master.
+                            </p>
+                        </td>
+                    </tr>
+                    <?php endif; ?>
                 </table>
 
                 <?php submit_button(); ?>
