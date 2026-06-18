@@ -658,6 +658,20 @@ class Fylgja_Receiver {
 
         $local_id = $preview['local_id'];
 
+        // Clone-slave adoption (mirrors the term path in apply_term_preview): a slave
+        // cloned from the master already holds this post but without a _fylgja_source_id
+        // stamp, so the source-id lookup misses and resync would insert a duplicate.
+        // Match the pre-existing post by WPML language + slug and adopt it (the stamp
+        // below claims it). Language scoping is what makes this safe — it never adopts a
+        // wrong-language sibling.
+        if (!$local_id) {
+            $local_id = $this->adopt_unstamped_post(
+                sanitize_text_field($payload['post_type'] ?? 'post'),
+                $payload['wpml']['language_code'] ?? null,
+                sanitize_title($payload['post_name'] ?? '')
+            );
+        }
+
         $post_data = [
             'post_title'   => sanitize_text_field($payload['post_title'] ?? ''),
             'post_content' => wp_kses_post($payload['post_content'] ?? ''),
@@ -760,6 +774,20 @@ class Fylgja_Receiver {
 
         $local_id = $preview['local_id'];
 
+        // Clone-slave adoption (same logic as posts/terms — an attachment is a post):
+        // a slave cloned from the master already holds this attachment without a
+        // _fylgja_source_id stamp, so the source-id lookup misses. Adopt the pre-existing
+        // attachment by WPML language + slug instead of re-downloading the file as a
+        // duplicate. Language scoping is required: the same filename slug exists once per
+        // language.
+        if (!$local_id) {
+            $local_id = $this->adopt_unstamped_post(
+                'attachment',
+                $payload['wpml']['language_code'] ?? null,
+                sanitize_title($payload['post_name'] ?? '')
+            );
+        }
+
         if (!$local_id) {
             require_once ABSPATH . 'wp-admin/includes/media.php';
             require_once ABSPATH . 'wp-admin/includes/file.php';
@@ -781,9 +809,12 @@ class Fylgja_Receiver {
                 return ['success' => false, 'error' => $attachment_id->get_error_message()];
             }
 
-            update_post_meta($attachment_id, '_fylgja_source_id', $source_id);
             $local_id = $attachment_id;
         }
+
+        // Stamp the source id on whichever attachment we ended up with — sideloaded
+        // OR adopted — so future source-id lookups resolve directly (mirrors the post path).
+        update_post_meta($local_id, '_fylgja_source_id', $source_id);
 
         // Attach WPML language/trid if WPML is active and payload includes the block.
         if (!empty($preview['wpml_plan']) && $preview['wpml_plan']['trid_action'] !== 'none') {
@@ -805,6 +836,40 @@ class Fylgja_Receiver {
         // exclude_from_search=true, which made re-syncs of those types insert
         // duplicates instead of updating in place.
         return (new Fylgja_Lookup())->find_post_by_source_id($source_id);
+    }
+
+    /**
+     * Finds a pre-existing, unstamped slave post to adopt during sync, matched by
+     * post_type + WPML language + slug. The post-side analogue of
+     * adopt_unstamped_term(): used when the _fylgja_source_id lookup misses on a slave
+     * cloned from the master. Language-scoped so it never picks a wrong-language
+     * sibling; the meta_id IS NULL guard prevents hijacking a post already mapped to
+     * another source id.
+     */
+    private function adopt_unstamped_post(string $post_type, ?string $language_code, string $slug): ?int {
+        if (!$language_code || $slug === '' || !$this->is_wpml_active()) {
+            return null;
+        }
+        global $wpdb;
+        $post_id = $wpdb->get_var($wpdb->prepare(
+            "SELECT p.ID
+             FROM {$wpdb->posts} p
+             JOIN {$wpdb->prefix}icl_translations tr
+                  ON tr.element_id = p.ID
+                 AND tr.element_type = %s
+             LEFT JOIN {$wpdb->postmeta} pm
+                  ON pm.post_id = p.ID AND pm.meta_key = '_fylgja_source_id'
+             WHERE p.post_type = %s
+               AND tr.language_code = %s
+               AND p.post_name = %s
+               AND pm.meta_id IS NULL
+             LIMIT 1",
+            'post_' . $post_type,
+            $post_type,
+            $language_code,
+            $slug
+        ));
+        return $post_id === null ? null : (int) $post_id;
     }
 
     private function delete_synced_post(int $source_id): array {
