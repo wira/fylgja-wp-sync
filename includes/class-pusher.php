@@ -181,7 +181,10 @@ class Fylgja_Pusher {
         $meta = get_term_meta($term->term_id);
         $flat_meta = [];
         foreach ($meta as $key => $values) {
-            $flat_meta[$key] = $values[0] ?? '';
+            // Keyless get_term_meta() returns RAW (still-serialized) values. Unserialize
+            // so array/object meta travels as real data — otherwise the slave's
+            // update_term_meta() re-serializes the already-serialized string.
+            $flat_meta[$key] = maybe_unserialize($values[0] ?? '');
         }
         return [
             'payload_version'  => 2,
@@ -207,7 +210,11 @@ class Fylgja_Pusher {
         $meta = get_post_meta($post->ID);
         $flat_meta = [];
         foreach ($meta as $key => $values) {
-            $flat_meta[$key] = $values[0] ?? '';
+            // Keyless get_post_meta() returns RAW (still-serialized) values. Unserialize
+            // so array/object meta (e.g. _menu_item_classes) travels as real data —
+            // otherwise the slave's update_post_meta() re-serializes the already-serialized
+            // string and the blob surfaces as a literal CSS class.
+            $flat_meta[$key] = maybe_unserialize($values[0] ?? '');
         }
 
         $taxonomies = get_object_taxonomies($post->post_type);

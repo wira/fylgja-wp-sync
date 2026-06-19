@@ -138,6 +138,20 @@ class Fylgja_Receiver {
             'warnings'    => [],
         ];
 
+        // Tripwire (non-destructive): incoming meta should already be real data — arrays
+        // and scalars. A value that arrives as a still-serialized STRING means the sender
+        // didn't unserialize it (e.g. an unpatched master), and applying it as-is makes
+        // update_*_meta double-serialize it, surfacing the blob as e.g. a literal CSS class.
+        // We never rewrite it — a legitimately serialized-looking string is indistinguishable
+        // from this bug — we only flag it so the mismatch shows in the log's Warnings column.
+        if (!empty($payload['meta']) && is_array($payload['meta'])) {
+            foreach ($payload['meta'] as $key => $value) {
+                if (is_string($value) && is_serialized($value, false)) {
+                    $base['warnings'][] = "Meta '{$key}' arrived as a serialized string; sender may be unpatched. Stored as-is.";
+                }
+            }
+        }
+
         switch ($object_type) {
             case 'post':
                 return $this->preview_post($action, $payload, $base);
