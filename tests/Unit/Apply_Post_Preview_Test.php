@@ -26,11 +26,17 @@ namespace Fylgja\Tests\Unit {
         /** @var array<int, array> Recorded update_post_meta() calls. */
         private array $post_meta;
 
+        /** @var string post_name the slave currently stores for the applied post (drives the reconcile). */
+        private string $stored_post_name;
+
         protected function setUp(): void {
             parent::setUp();
             Monkey\setUp();
 
             $this->post_meta = [];
+            // Default: the stored name already matches the master, so the verbatim
+            // reconcile is a no-op. Tests that exercise drift override this.
+            $this->stored_post_name = 'aito-flagship-store';
 
             Functions\when('sanitize_text_field')->returnArg();
             Functions\when('sanitize_title')->returnArg();
@@ -40,6 +46,7 @@ namespace Fylgja\Tests\Unit {
                 $this->post_meta[] = [$id, $key, $value];
                 return true;
             });
+            Functions\when('get_post_field')->alias(fn ($field, $id) => $this->stored_post_name);
             // is_wpml_active() -> true
             Functions\when('wpml_get_active_languages_filter')->justReturn([]);
         }
@@ -136,6 +143,32 @@ namespace Fylgja\Tests\Unit {
             $this->assertTrue($result['success']);
             $this->assertSame(9001, $result['local_id'], 'a brand-new post is inserted when nothing matches');
             $this->assertContains([9001, '_fylgja_source_id', 70], $this->post_meta);
+        }
+
+        public function test_insert_reconciles_drifted_post_name_to_master(): void {
+            // A freshly-inserted translation can land as "<slug>-2": wp_insert_post runs
+            // wp_unique_post_slug, which only language-scopes once the post HAS a language,
+            // so the bare master slug collides with the sibling translation and gets
+            // suffixed. After the WPML language is attached the slave must reconcile the
+            // post_name back to the master's verbatim value.
+            $GLOBALS['wpdb'] = $this->wpdb_returning(null); // no clone match -> insert path
+            $this->stored_post_name = 'aito-flagship-store-2'; // what wp_insert_post left behind
+
+            Functions\when('wp_insert_post')->justReturn(9001);
+            $reconciled = [];
+            Functions\when('wp_update_post')->alias(function ($data, $wp_error = false) use (&$reconciled) {
+                $reconciled[] = $data;
+                return $data['ID'];
+            });
+
+            $result = $this->invoke_apply_post_preview($this->make_preview());
+
+            $this->assertTrue($result['success']);
+            $this->assertContains(
+                ['ID' => 9001, 'post_name' => 'aito-flagship-store'],
+                $reconciled,
+                'drifted post_name must be reconciled to the verbatim master slug'
+            );
         }
     }
 }
