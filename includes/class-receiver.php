@@ -190,10 +190,29 @@ class Fylgja_Receiver {
         }
 
         if (!empty($result['success'])) {
-            $this->sweep_deferred_refs();
+            $this->maybe_sweep_deferred_refs();
         }
 
         return $result;
+    }
+
+    /** Seconds the inline post-apply sweep is suppressed after it runs. */
+    private const INLINE_SWEEP_THROTTLE = 10;
+
+    /**
+     * Inline sweep after a successful apply, throttled so a bulk burst (resync pushing
+     * ~1500 items) collapses the per-apply O(deferred-rows) sweep into an occasional pass
+     * instead of running it on every single request — a major slave-side cost that helped
+     * saturate it. A lone interactive edit still sweeps immediately (the throttle window
+     * has long since expired), and the fylgja_sweep_deferred cron always does a full
+     * unthrottled pass as the safety net.
+     */
+    private function maybe_sweep_deferred_refs(): void {
+        if (get_transient('fylgja_inline_sweep_throttle')) {
+            return;
+        }
+        set_transient('fylgja_inline_sweep_throttle', 1, self::INLINE_SWEEP_THROTTLE);
+        $this->sweep_deferred_refs();
     }
 
     public function run_deferred_sweep(): void {

@@ -38,7 +38,7 @@ foreach ($options as $option) {
 
 delete_transient('fylgja_slave_health');
 
-$events = ['fylgja_process_queue', 'fylgja_push_strings', 'fylgja_sweep_deferred', 'fylgja_resync_tick'];
+$events = ['fylgja_process_queue', 'fylgja_push_strings', 'fylgja_sweep_deferred', 'fylgja_resync_tick', 'fylgja_retry_failed'];
 foreach ($events as $event) {
     $timestamp = wp_next_scheduled($event);
     while ($timestamp) {

@@ -94,6 +94,25 @@ class Fylgja_Queue {
         );
     }
 
+    /**
+     * Promotes failed rows back to pending for another flush attempt — but only those
+     * still under the attempt cap and past a cool-off window, so a transient slave
+     * timeout/500 self-heals without hot-looping. Rows at the cap stay failed as a dead
+     * letter. updated_at is compared with NOW() to match how mark_failed() stamps it.
+     */
+    public function requeue_retryable(int $max_attempts = 5, int $backoff_seconds = 300): int {
+        global $wpdb;
+        return (int) $wpdb->query($wpdb->prepare(
+            "UPDATE {$this->table}
+                SET status = 'pending'
+              WHERE status = 'failed'
+                AND attempts < %d
+                AND updated_at < (NOW() - INTERVAL %d SECOND)",
+            $max_attempts,
+            $backoff_seconds
+        ));
+    }
+
     public function flush_completed(): int {
         global $wpdb;
         return (int) $wpdb->query(

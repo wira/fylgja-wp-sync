@@ -149,8 +149,17 @@ class Fylgja_Resync {
 
     private function count_strings(): int {
         global $wpdb;
-        $table = $wpdb->prefix . 'icl_strings';
-        return (int) $wpdb->get_var("SELECT COUNT(*) FROM {$table} WHERE string_package_id IS NULL");
+        $table        = $wpdb->prefix . 'icl_strings';
+        $translations = $wpdb->prefix . 'icl_string_translations';
+        // Count only translatable strings — the ones push_string_batch will actually
+        // push (build_payload skips strings with no translations). Counting all
+        // strings made the resync progress read e.g. 24/1965 and look stuck, when
+        // 24 was in fact every pushable string.
+        return (int) $wpdb->get_var(
+            "SELECT COUNT(*) FROM {$table} s
+             WHERE s.string_package_id IS NULL
+               AND EXISTS (SELECT 1 FROM {$translations} t WHERE t.string_id = s.id)"
+        );
     }
 
     /** @return array{pushed:int,examined:int} */
@@ -214,12 +223,19 @@ class Fylgja_Resync {
     private function push_string_batch(array &$state, int $batch_size): array {
         global $wpdb;
         $cursor = (int) ($state['cursor'] ?? 0);
-        $strings_table = $wpdb->prefix . 'icl_strings';
+        $strings_table      = $wpdb->prefix . 'icl_strings';
+        $translations_table = $wpdb->prefix . 'icl_string_translations';
+        // Scan only translatable strings so the cursor leaps straight from one to the
+        // next. Scanning all strings made this phase walk the entire icl_strings table
+        // (e.g. 1965 rows, 25 at a time) just to push the ~25 that carry translations,
+        // taking ~78 cron ticks while the progress counter sat frozen. The EXISTS clause
+        // mirrors build_payload's skip condition, so examined ~= pushed.
         $rows = $wpdb->get_results($wpdb->prepare(
-            "SELECT id, context, name, gettext_context, value, status, string_type, wrap_tag
-             FROM {$strings_table}
-             WHERE id > %d AND string_package_id IS NULL
-             ORDER BY id ASC LIMIT %d",
+            "SELECT s.id, s.context, s.name, s.gettext_context, s.value, s.status, s.string_type, s.wrap_tag
+             FROM {$strings_table} s
+             WHERE s.id > %d AND s.string_package_id IS NULL
+               AND EXISTS (SELECT 1 FROM {$translations_table} t WHERE t.string_id = s.id)
+             ORDER BY s.id ASC LIMIT %d",
             $cursor, $batch_size
         ));
 

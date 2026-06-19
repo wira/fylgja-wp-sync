@@ -317,6 +317,19 @@ class Fylgja_Pusher {
         ];
     }
 
+    /**
+     * HTTP timeout (seconds) for a single push. Resync floods the slave with heavy WPML
+     * writes, and a single item that runs past the interactive 30s gets abandoned
+     * mid-flight — which leaves the slave still processing it while the next item arrives,
+     * piling on concurrency until it tips into timeouts/500s. Give resync-sourced items a
+     * far longer ceiling so legitimately-slow items finish instead of cascading.
+     * Filterable for site-specific tuning.
+     */
+    private function push_timeout(string $source_kind): int {
+        $timeout = $source_kind === 'resync' ? 120 : 30;
+        return max(1, (int) apply_filters('fylgja_push_timeout', $timeout, $source_kind));
+    }
+
     private function send_to_slave(object $item): bool {
         $remote_url = get_option('fylgja_remote_url', '');
         if (empty($remote_url)) {
@@ -334,7 +347,7 @@ class Fylgja_Pusher {
                 'payload'     => $payload,
             ]),
             'headers' => ['Content-Type' => 'application/json'],
-            'timeout' => 30,
+            'timeout' => $this->push_timeout((string) ($item->source_kind ?? 'hook')),
         ];
 
         $args = $this->auth->add_auth_headers($args);

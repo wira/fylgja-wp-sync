@@ -69,6 +69,13 @@ add_action('fylgja_resync_tick', function () {
     (new Fylgja_Resync($queue, $pusher))->tick();
 });
 
+add_action('fylgja_retry_failed', function () {
+    $queue = new Fylgja_Queue();
+    if ($queue->requeue_retryable() > 0) {
+        (new Fylgja_Pusher($queue, new Fylgja_Auth()))->ensure_flush_scheduled();
+    }
+});
+
 add_action('init', function () {
     $role = get_option('fylgja_role', 'disabled');
 
@@ -80,6 +87,10 @@ add_action('init', function () {
 
         if (!wp_next_scheduled('fylgja_push_strings')) {
             wp_schedule_event(time() + 300, 'fylgja_five_minutes', 'fylgja_push_strings');
+        }
+
+        if (!wp_next_scheduled('fylgja_retry_failed')) {
+            wp_schedule_event(time() + 300, 'fylgja_five_minutes', 'fylgja_retry_failed');
         }
     }
 
