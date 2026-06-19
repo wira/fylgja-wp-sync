@@ -400,7 +400,12 @@ class Fylgja_Receiver {
         }
 
         $target_lang = $preview['wpml_plan']['language_code'] ?? null;
-        $slug_base   = ($payload['slug'] ?? '') !== '' ? $payload['slug'] : ($payload['name'] ?? '');
+        // Mirror the master verbatim: the slave replicates the master's slug as-is
+        // rather than re-deriving a "unique" one. The master is the source of truth and
+        // already guarantees a valid slug; WPML legitimately lets a term and its
+        // translations share one slug (disambiguated by language), so re-uniquifying
+        // here only drifts the slave away from the master (the old <slug>-2 / <slug>-{lang}).
+        $slug        = sanitize_title(($payload['slug'] ?? '') !== '' ? $payload['slug'] : ($payload['name'] ?? ''));
         $description = wp_kses_post($payload['description'] ?? '');
 
         // Run inserts AND updates under the term's own language. WPML's get_term
@@ -411,37 +416,34 @@ class Fylgja_Receiver {
         // disables that adjustment while wp_update_term is on the stack, but the
         // guard only scans ~19 backtrace frames and our REST/resync stack is deeper,
         // so the guard misses. Switching to the target language makes the adjustment
-        // a no-op (the term resolves to itself) — mirroring WPML_Update_Term_Action.
-        $switch_lang = $target_lang && ($preview['wpml_plan']['trid_action'] ?? 'none') !== 'none';
+        // a no-op (the term resolves to itself), which is exactly what lets the shared
+        // master slug be accepted verbatim. It must therefore run for ANY target
+        // language, not only when there is trid work to do — an already-mapped clone
+        // term reports trid_action 'none' yet still needs the switch to keep its slug.
+        $switch_lang = (bool) $target_lang;
         if ($switch_lang) {
             $prev_lang = apply_filters('wpml_current_language', null);
             do_action('wpml_switch_language', $target_lang);
         }
         try {
+            $args = [
+                'slug'        => $slug,
+                'description' => $description,
+                'parent'      => $parent_local_id,
+            ];
             if ($local_id) {
-                $args = [
-                    'slug'        => $this->resolve_term_slug($slug_base, $taxonomy, $target_lang, $local_id),
-                    'description' => $description,
-                    'parent'      => $parent_local_id,
-                ];
                 $result = wp_update_term($local_id, $taxonomy, ['name' => $payload['name']] + $args);
             } else {
-                $args = [
-                    'slug'        => $this->resolve_term_slug($slug_base, $taxonomy, $target_lang, 0),
-                    'description' => $description,
-                    'parent'      => $parent_local_id,
-                ];
                 $result = wp_insert_term($payload['name'], $taxonomy, $args);
                 if (is_wp_error($result)) {
                     // Adopt an existing same-identity term instead of failing. An install
                     // synced before source-id stamping was reliable can already hold this
                     // term under a different/absent _fylgja_source_id, so the insert
-                    // collides (term_exists). Update it in place; the source-id stamp
-                    // below then claims it for future lookups.
+                    // collides (term_exists). Update it in place with the same verbatim
+                    // slug; the source-id stamp below then claims it for future lookups.
                     $existing_id = $this->existing_term_id_from_error($result);
                     if ($existing_id > 0) {
                         $local_id = $existing_id;
-                        $args['slug'] = $this->resolve_term_slug($slug_base, $taxonomy, $target_lang, $existing_id);
                         $result = wp_update_term($local_id, $taxonomy, ['name' => $payload['name']] + $args);
                     }
                 }
@@ -478,6 +480,9 @@ class Fylgja_Receiver {
             }
         }
 
+        // Mirror the master term slug verbatim now that the language/trid is attached.
+        $this->enforce_master_term_slug($local_id, $taxonomy, $slug);
+
         if ($needs_deferred_parent) {
             (new Fylgja_Deferred_Refs())->insert(
                 'term_parent',
@@ -512,55 +517,6 @@ class Fylgja_Receiver {
     }
 
     /**
-     * Picks a slug that is unique among *other* terms in the taxonomy.
-     *
-     * The master may carry duplicate slugs across a term and its WPML
-     * translations (the WPML category editor sets no slug, and migrated data can
-     * share one). WP core's wp_update_term rejects any slug already owned by
-     * another term with `duplicate_term_slug`, and WPML does not language-scope
-     * that check outside a real wp-admin request — so we resolve the slug here
-     * rather than relying on core/WPML to do it.
-     *
-     * Priority: (1) keep the term's current slug if still unique — so repeated
-     * resyncs don't churn it and the default-language term keeps its bare slug;
-     * (2) the source slug if free; (3) for non-default languages, `slug-{lang}`
-     * (mirrors WPML's native scheme); (4) a numeric suffix.
-     */
-    private function resolve_term_slug(string $base, string $taxonomy, ?string $target_lang, int $exclude_term_id): string {
-        $base = sanitize_title($base);
-        if ($base === '') {
-            return $base;
-        }
-
-        if ($exclude_term_id > 0) {
-            $current = $this->current_term_slug($exclude_term_id);
-            if ($current !== null && $current !== '' && !$this->term_slug_taken($current, $taxonomy, $exclude_term_id)) {
-                return $current;
-            }
-        }
-
-        if (!$this->term_slug_taken($base, $taxonomy, $exclude_term_id)) {
-            return $base;
-        }
-
-        $default_lang = (string) apply_filters('wpml_default_language', null);
-        $candidate    = $base;
-        if ($target_lang && $default_lang && $target_lang !== $default_lang) {
-            $lang_slug = $base . '-' . $target_lang;
-            if (!$this->term_slug_taken($lang_slug, $taxonomy, $exclude_term_id)) {
-                return $lang_slug;
-            }
-            $candidate = $lang_slug;
-        }
-
-        $i = 2;
-        while ($this->term_slug_taken($candidate . '-' . $i, $taxonomy, $exclude_term_id)) {
-            $i++;
-        }
-        return $candidate . '-' . $i;
-    }
-
-    /**
      * Finds a pre-existing, unstamped slave term to adopt during sync, matched by
      * taxonomy + WPML language + slug. Used when the _fylgja_source_id lookup
      * misses on a slave cloned from the master. Language-scoped so it never picks
@@ -592,29 +548,6 @@ class Fylgja_Receiver {
             $slug
         ));
         return $term_id === null ? null : (int) $term_id;
-    }
-
-    private function current_term_slug(int $term_id): ?string {
-        global $wpdb;
-        $slug = $wpdb->get_var($wpdb->prepare(
-            "SELECT slug FROM {$wpdb->terms} WHERE term_id = %d LIMIT 1",
-            $term_id
-        ));
-        return $slug === null ? null : (string) $slug;
-    }
-
-    private function term_slug_taken(string $slug, string $taxonomy, int $exclude_term_id): bool {
-        global $wpdb;
-        $id = $wpdb->get_var($wpdb->prepare(
-            "SELECT t.term_id FROM {$wpdb->terms} t
-             JOIN {$wpdb->term_taxonomy} tt ON tt.term_id = t.term_id
-             WHERE t.slug = %s AND tt.taxonomy = %s AND t.term_id != %d
-             LIMIT 1",
-            $slug,
-            $taxonomy,
-            $exclude_term_id
-        ));
-        return $id !== null;
     }
 
     private function preview_string(string $action, array $payload, array $base): array {
@@ -734,6 +667,9 @@ class Fylgja_Receiver {
             $plan_with_source['source_trid'] = (int) ($payload['wpml']['source_trid'] ?? 0);
             $this->mapper->attach($result_id, $preview['element_type'], $plan_with_source);
         }
+
+        // Mirror the master post_name verbatim now that the language is attached.
+        $this->enforce_master_post_name($result_id, $payload['post_name'] ?? '');
 
         if (!empty($payload['meta'])) {
             $this->sync_post_meta($result_id, $payload['meta']);
@@ -856,11 +792,54 @@ class Fylgja_Receiver {
             $this->mapper->attach($local_id, $preview['element_type'], $plan_with_source);
         }
 
+        // Mirror the master post_name verbatim now that the language is attached.
+        $this->enforce_master_post_name($local_id, $payload['post_name'] ?? '');
+
         if (!empty($payload['meta'])) {
             $this->sync_post_meta($local_id, $payload['meta']);
         }
 
         return ['success' => true, 'local_id' => $local_id, 'source_id' => $source_id];
+    }
+
+    /**
+     * Mirrors the master's post_name verbatim. wp_insert_post()/wp_update_post() route the
+     * slug through wp_unique_post_slug(), which WPML only language-scopes once the post HAS
+     * a language — so a freshly-inserted translation lands as "<slug>-2" (its bare master
+     * slug collides with a sibling translation in another language). Once the WPML language
+     * is attached, re-applying the master post_name resolves under the correct language and
+     * keeps it verbatim. A no-op on the adopt/update path, where it already matches.
+     */
+    private function enforce_master_post_name(int $post_id, string $master_name): void {
+        $master_name = sanitize_title($master_name);
+        if ($master_name === '' || get_post_field('post_name', $post_id) === $master_name) {
+            return;
+        }
+        wp_update_post(['ID' => $post_id, 'post_name' => $master_name]);
+    }
+
+    /**
+     * Mirrors the master term slug verbatim. wp_insert_term() routes a new term's slug
+     * through wp_unique_term_slug(), which WPML can only language-scope once the term HAS
+     * a language — but the WPML language/trid is attached only AFTER the insert, so a
+     * fresh translation lands as "<slug>-2" (its bare master slug collides with a sibling
+     * translation). Re-applying the slug here writes it directly: wp_update_term's
+     * provided-slug duplicate check still resolves the not-yet-renamed term against its
+     * wrong-language sibling, and the master is the source of truth, so the verbatim slug
+     * is authoritative. A no-op on the update/adopt path, where the slug already matches.
+     */
+    private function enforce_master_term_slug(int $term_id, string $taxonomy, string $master_slug): void {
+        global $wpdb;
+        $master_slug = sanitize_title($master_slug);
+        if ($master_slug === '') {
+            return;
+        }
+        $current = $wpdb->get_var($wpdb->prepare("SELECT slug FROM {$wpdb->terms} WHERE term_id = %d", $term_id));
+        if ((string) $current === $master_slug) {
+            return;
+        }
+        $wpdb->update($wpdb->terms, ['slug' => $master_slug], ['term_id' => $term_id]);
+        clean_term_cache($term_id, $taxonomy);
     }
 
     private function find_local_post(int $source_id): ?int {

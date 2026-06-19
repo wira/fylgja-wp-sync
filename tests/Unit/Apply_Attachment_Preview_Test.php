@@ -54,6 +54,9 @@ namespace Fylgja\Tests\Unit {
                 $this->post_meta[] = [$id, $key, $value];
                 return true;
             });
+            // Stored post_name already matches the master, so the verbatim reconcile
+            // (enforce_master_post_name) is a no-op here.
+            Functions\when('get_post_field')->justReturn('soho-chaowai-06');
             // is_wpml_active() -> true
             Functions\when('wpml_get_active_languages_filter')->justReturn([]);
         }

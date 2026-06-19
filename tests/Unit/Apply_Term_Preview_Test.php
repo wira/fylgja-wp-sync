@@ -79,9 +79,11 @@ namespace Fylgja\Tests\Unit {
                 public string $term_taxonomy = 'wp_term_taxonomy';
                 public function prepare($query, ...$args) { return $query; }
                 public function get_var($query) { return null; } // term not found / slug free
+                public function update($table, $data, $where) { return 1; } // verbatim-slug reconcile
             };
 
             Functions\when('taxonomy_exists')->justReturn(true);
+            Functions\when('clean_term_cache')->justReturn(null);
             Functions\when('sanitize_title')->returnArg();
             Functions\when('wp_kses_post')->returnArg();
             Functions\when('is_wp_error')->alias(fn ($thing) => $thing instanceof \WP_Error);
@@ -215,11 +217,18 @@ namespace Fylgja\Tests\Unit {
             $this->assertSame('tax_category', $spy->attached[0]['element_type']);
         }
 
-        public function test_update_of_translation_resolves_colliding_slug_to_lang_suffix(): void {
-            // The term already exists on the slave (update path), and its source
-            // slug "best-of" is owned by the English original. wp_update_term would
-            // reject "best-of" with duplicate_term_slug, so the slug must resolve to
-            // the WPML-style "best-of-zh-hans".
+        public function test_update_of_translation_keeps_verbatim_master_slug(): void {
+            // Master is the source of truth. A zh-hans translation whose master slug is
+            // "best-of" (shared with its English original, as WPML allows) must be
+            // mirrored VERBATIM on the slave — not re-derived to "best-of-zh-hans" or
+            // "best-of-2". The update runs under the term's language (see the dedicated
+            // test below), where WPML language-scopes wp_update_term's duplicate check so
+            // the shared slug is accepted.
+            //
+            // The wpdb models the sibling collision the old re-derivation reacted to: the
+            // English original owns the bare "best-of" globally. Verbatim mirroring must
+            // IGNORE that (it is the wrong-language sibling) and keep "best-of" — whereas
+            // the old resolve_term_slug turned it into "best-of-zh-hans".
             $GLOBALS['wpdb'] = new class {
                 public string $prefix = 'wp_';
                 public string $terms = 'wp_terms';
@@ -237,18 +246,15 @@ namespace Fylgja\Tests\Unit {
                 }
                 public function get_var($query) {
                     if (strpos($query, 'SELECT slug FROM') !== false) {
-                        return 'best-of'; // current slug squats the original's slug
-                    }
-                    if (strpos($query, "t.slug = 'best-of-zh-hans'") !== false) {
-                        return null; // language-suffixed slug is free
+                        return 'best-of'; // current slug already mirrors the master
                     }
                     if (strpos($query, "t.slug = 'best-of'") !== false) {
-                        return 99; // English original owns the bare slug
+                        return 99; // English original owns the bare slug globally
                     }
                     return null;
                 }
+                public function update($table, $data, $where) { return 1; }
             };
-
             Functions\when('apply_filters')->alias(function ($hook, $value, ...$rest) {
                 if ($hook === 'wpml_default_language') {
                     return 'en';
@@ -274,7 +280,7 @@ namespace Fylgja\Tests\Unit {
 
             $this->assertTrue($result['success'], 'update must not fail with duplicate_term_slug');
             $this->assertSame(5151, $captured['id'], 'the existing local term is updated in place');
-            $this->assertSame('best-of-zh-hans', $captured['slug'], 'colliding slug resolves to the WPML lang-suffixed slug');
+            $this->assertSame('best-of', $captured['slug'], 'the master slug is mirrored verbatim, not re-derived');
         }
 
         public function test_update_of_translation_runs_under_target_language(): void {
@@ -296,6 +302,29 @@ namespace Fylgja\Tests\Unit {
             $this->assertTrue($result['success']);
             $this->assertSame('zh-hans', $lang_at_update, 'wp_update_term must run under the target language');
             $this->assertSame('en', $this->current_lang, 'language must be restored after the update');
+        }
+
+        public function test_update_runs_under_target_language_even_when_trid_action_none(): void {
+            // The language switch is what lets WPML language-scope the duplicate-slug
+            // check so the verbatim master slug is accepted. It must therefore happen
+            // whenever the term has a target language — NOT only when there is WPML trid
+            // work to do (trid_action !== 'none'). An already-correctly-mapped clone term
+            // reports trid_action 'none', yet still needs the switch to keep its slug.
+            $lang_at_update = null;
+            Functions\when('wp_update_term')->alias(function ($id, $tax, $args = []) use (&$lang_at_update) {
+                $lang_at_update = $this->current_lang;
+                return ['term_id' => $id, 'term_taxonomy_id' => 8001];
+            });
+
+            $preview = $this->make_preview();
+            $preview['local_id'] = 5151;                  // existing term -> update path
+            $preview['wpml_plan']['trid_action'] = 'none'; // no trid work, but still has a language
+
+            $result = $this->invoke_apply_term_preview($preview);
+
+            $this->assertTrue($result['success']);
+            $this->assertSame('zh-hans', $lang_at_update, 'switch must happen for any target language, not just non-none trid actions');
+            $this->assertSame('en', $this->current_lang, 'language must be restored afterwards');
         }
 
         public function test_unstamped_clone_term_is_adopted_by_language_and_slug(): void {
@@ -326,6 +355,7 @@ namespace Fylgja\Tests\Unit {
                     }
                     return null; // source-id lookup misses; slug is free
                 }
+                public function update($table, $data, $where) { return 1; }
             };
 
             $updated = [];
@@ -343,6 +373,53 @@ namespace Fylgja\Tests\Unit {
             $this->assertSame(4321, $result['local_id'], 'the pre-existing clone term is adopted');
             $this->assertContains(4321, $updated, 'adopted term is updated in place');
             $this->assertContains([4321, '_fylgja_source_id', 70], $this->term_meta, 'adopted term gets stamped');
+        }
+
+        public function test_insert_reconciles_drifted_term_slug_to_master(): void {
+            // A genuinely new translation takes the insert branch. wp_unique_term_slug can
+            // only language-scope once the term has a language, but WPML's trid/language is
+            // attached AFTER the insert — so the bare master slug collides with its sibling
+            // and lands as "<slug>-2". Once attached, the slave must force the slug back to
+            // the master verbatim (a direct write, since the master is the source of truth).
+            $wpdb = new class {
+                public array $writes = [];
+                public string $prefix = 'wp_';
+                public string $terms = 'wp_terms';
+                public string $termmeta = 'wp_termmeta';
+                public string $term_taxonomy = 'wp_term_taxonomy';
+                public function prepare($query, ...$args) {
+                    if (count($args) === 1 && is_array($args[0])) { $args = $args[0]; }
+                    foreach ($args as $a) {
+                        $repl  = is_string($a) ? "'" . $a . "'" : (string) $a;
+                        $query = preg_replace('/%[ds]/', $repl, $query, 1);
+                    }
+                    return $query;
+                }
+                public function get_var($query) {
+                    if (strpos($query, 'SELECT slug FROM') !== false) {
+                        return 'best-of-2'; // what wp_insert_term left behind
+                    }
+                    return null; // source-id lookup + adoption miss -> insert path
+                }
+                public function update($table, $data, $where) { $this->writes[] = compact('data', 'where'); return 1; }
+            };
+            $GLOBALS['wpdb'] = $wpdb;
+
+            Functions\when('wp_insert_term')->justReturn(['term_id' => 7001, 'term_taxonomy_id' => 8001]);
+
+            $preview = $this->make_preview();
+            $preview['local_id']        = null;       // insert path
+            $preview['payload']['slug'] = 'best-of';
+            $preview['payload']['name'] = 'Best of';
+
+            $result = $this->invoke_apply_term_preview($preview);
+
+            $this->assertTrue($result['success']);
+            $this->assertContains(
+                ['data' => ['slug' => 'best-of'], 'where' => ['term_id' => 7001]],
+                $wpdb->writes,
+                'drifted insert slug must be reconciled to the verbatim master slug'
+            );
         }
     }
 }
