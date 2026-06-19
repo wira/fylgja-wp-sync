@@ -11,3 +11,7 @@ composer.lock
 /docs/superpowers/
 /db-query.md
 /wpml/
+
+# Build artifacts — keep the directory, ignore the packaged zips it holds
+/build/*
+!/build/.gitkeep

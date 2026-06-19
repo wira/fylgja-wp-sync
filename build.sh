@@ -7,6 +7,8 @@
 # wp-content/plugins/fylgja-wp-sync/. .gitignore is honored by enumerating files
 # with `git ls-files`: anything ignored is untracked and can never slip in.
 #
+# The zip is written to build/ (gitignored), keeping artifacts out of the repo root.
+#
 # Usage: ./build.sh
 
 set -euo pipefail
@@ -32,6 +34,8 @@ if [[ -z "$VERSION" ]]; then
 fi
 
 ZIP="$SLUG-$VERSION.zip"
+BUILD_DIR="$ROOT/build"
+ZIP_PATH="$BUILD_DIR/$ZIP"
 
 # Runtime files that make up the published plugin.
 INCLUDE_PATHS=(
@@ -60,8 +64,9 @@ for f in "${FILES[@]}"; do
     cp "$f" "$dest"
 done
 
-rm -f "$ROOT/$ZIP"
-( cd "$STAGE" && zip -rq "$ROOT/$ZIP" "$SLUG" )
+mkdir -p "$BUILD_DIR"
+rm -f "$ZIP_PATH"
+( cd "$STAGE" && zip -rq "$ZIP_PATH" "$SLUG" )
 
-echo "Created $ZIP (${#FILES[@]} files)"
+echo "Created build/$ZIP (${#FILES[@]} files)"
 ( cd "$STAGE" && find "$SLUG" -type f | sort | sed 's/^/  /' )
