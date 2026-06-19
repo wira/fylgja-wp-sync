@@ -17,6 +17,11 @@ class Fylgja_Sync_Log {
         global $wpdb;
 
         $wpdb->insert($this->table, [
+            // Stamp UTC explicitly. The column DEFAULTs to MySQL CURRENT_TIMESTAMP, which
+            // uses the DB server timezone (not UTC) — so on a non-UTC server it stores
+            // local time, and the admin viewer (get_date_from_gmt) then double-applies the
+            // offset, showing wrong times. gmdate() is UTC regardless of the MySQL/WP tz.
+            'received_at' => gmdate('Y-m-d H:i:s'),
             'action'      => $action,
             'object_type' => $object_type,
             'source_id'   => (int) ($payload['source_id'] ?? 0),

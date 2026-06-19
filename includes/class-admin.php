@@ -347,9 +347,9 @@ class Fylgja_Admin {
         $log  = new Fylgja_Sync_Log();
         $rows = $log->query($filters, 1, 50);
 
-        // received_at is stored as a UTC DATETIME (MySQL CURRENT_TIMESTAMP). Emit an
-        // ISO-8601 value carrying an offset so the browser can render it in the
-        // viewer's local timezone unambiguously.
+        // received_at is stamped as a UTC DATETIME at insert time (gmdate, not the DB's
+        // local-tz CURRENT_TIMESTAMP default). Emit an ISO-8601 value carrying an offset
+        // so the browser can render it in the viewer's local timezone unambiguously.
         foreach ($rows as $row) {
             $row->received_at_iso = !empty($row->received_at)
                 ? get_date_from_gmt($row->received_at, 'c')
