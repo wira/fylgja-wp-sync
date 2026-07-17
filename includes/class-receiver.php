@@ -651,6 +651,11 @@ class Fylgja_Receiver {
             'menu_order'   => (int) ($payload['menu_order'] ?? 0),
         ];
 
+        // Capture the create signal before wp_insert_post reassigns $local_id: an empty
+        // $local_id here means no pre-existing slave copy (neither source-id lookup nor
+        // clone adoption matched), so this is a first-time create.
+        $is_create = empty($local_id);
+
         if ($local_id) {
             $post_data['ID'] = $local_id;
             $result_id = wp_update_post($post_data, true);
@@ -675,7 +680,7 @@ class Fylgja_Receiver {
         $this->enforce_master_post_name($result_id, $payload['post_name'] ?? '');
 
         if (!empty($payload['meta'])) {
-            $this->sync_post_meta($result_id, $payload['meta']);
+            $this->sync_post_meta($result_id, $payload['meta'], $is_create);
         }
 
         if (!empty($payload['terms'])) {
@@ -760,6 +765,11 @@ class Fylgja_Receiver {
             );
         }
 
+        // Capture the create signal before media_handle_sideload reassigns $local_id: an
+        // empty $local_id after adoption means no pre-existing slave copy, so the sideload
+        // below is a first-time create. Kept consistent with the post path.
+        $is_create = empty($local_id);
+
         if (!$local_id) {
             require_once ABSPATH . 'wp-admin/includes/media.php';
             require_once ABSPATH . 'wp-admin/includes/file.php';
@@ -799,7 +809,7 @@ class Fylgja_Receiver {
         $this->enforce_master_post_name($local_id, $payload['post_name'] ?? '');
 
         if (!empty($payload['meta'])) {
-            $this->sync_post_meta($local_id, $payload['meta']);
+            $this->sync_post_meta($local_id, $payload['meta'], $is_create);
         }
 
         return ['success' => true, 'local_id' => $local_id, 'source_id' => $source_id];

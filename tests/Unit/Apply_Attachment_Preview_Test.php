@@ -135,5 +135,45 @@ namespace Fylgja\Tests\Unit {
             $this->assertSame(9001, $result['local_id'], 'a brand-new attachment is sideloaded when nothing matches');
             $this->assertContains([9001, '_fylgja_source_id', 70], $this->post_meta);
         }
+
+        /**
+         * $is_create wiring on the attachment path. Attachments don't normally carry
+         * site-local keys, but the sideload/create branch captures $is_create at a
+         * different point than the post path (after adoption, before sideload reassigns
+         * $local_id), so exercise the flag with a site-local key to guard against an
+         * independent regression: a sideloaded (create) attachment seeds it.
+         */
+        public function test_sideloaded_attachment_seeds_site_local_key(): void {
+            $GLOBALS['wpdb'] = $this->wpdb_returning(null); // no clone match -> sideload -> create
+            Functions\when('download_url')->justReturn('/tmp/fake-download.jpg');
+            Functions\when('wp_parse_url')->returnArg();
+            Functions\when('media_handle_sideload')->justReturn(9001);
+
+            $preview = $this->make_preview();
+            $preview['payload']['meta'] = ['position' => 7];
+
+            $this->invoke_apply_attachment_preview($preview);
+
+            $this->assertContains([9001, 'position', 7], $this->post_meta, 'create seeds site-local key');
+        }
+
+        /**
+         * The adopt/update path preserves the slave's own site-local value: an adopted
+         * pre-existing attachment must NOT have `position` overwritten from the master.
+         */
+        public function test_adopted_attachment_preserves_site_local_key(): void {
+            $GLOBALS['wpdb'] = $this->wpdb_returning(4321); // clone adopted -> update
+            Functions\when('download_url')->alias(function () {
+                throw new \RuntimeException('must adopt the existing clone attachment, not re-download');
+            });
+
+            $preview = $this->make_preview();
+            $preview['payload']['meta'] = ['position' => 7];
+
+            $this->invoke_apply_attachment_preview($preview);
+
+            $keys = array_column($this->post_meta, 1);
+            $this->assertNotContains('position', $keys, 'update preserves slave site-local key');
+        }
     }
 }
