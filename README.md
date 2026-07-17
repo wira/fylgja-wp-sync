@@ -158,6 +158,11 @@ post never produces duplicate pending rows.
 - **Bidirectional sync** is not supported. Master → slave only.
 - **Orphan cleanup** is operator-driven. If an object is deleted on master before sync
   caught up, the slave may retain it.
+- **Homepage grid placement is site-local.** The `position` and `meta-empty` post-meta
+  keys (which control a post's anySCALE homepage grid slot) are seeded from the master
+  only on a post's first sync, then never overwritten. This lets the slave curate its own
+  homepage independently; the trade-off is that the slave will not track later placement
+  changes made on the master.
 
 ## WPML setup checklist
 
