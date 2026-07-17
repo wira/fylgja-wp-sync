@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Fylgja WP Sync
  * Description: Master/slave content synchronization between WordPress sites via REST API.
- * Version: 1.0.2
+ * Version: 1.0.3
  * Author: Wira Ciputra
  * Text Domain: fylgja-wp-sync
  * Requires PHP: 8.0
