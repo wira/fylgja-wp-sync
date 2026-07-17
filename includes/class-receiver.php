@@ -10,6 +10,9 @@ class Fylgja_Receiver {
     private Fylgja_Sync_Log $log;
     private Fylgja_Wpml_Mapper $mapper;
 
+    /** Meta keys the slave owns locally: seeded once on create, never overwritten after. */
+    private const SITE_LOCAL_META = ['position', 'meta-empty'];
+
     public function __construct(Fylgja_Auth $auth, ?Fylgja_Sync_Log $log = null, ?Fylgja_Wpml_Mapper $mapper = null) {
         $this->auth = $auth;
         $this->log  = $log ?? new Fylgja_Sync_Log();
@@ -896,13 +899,19 @@ class Fylgja_Receiver {
         return ['success' => true, 'deleted_local_id' => $local_id];
     }
 
-    private function sync_post_meta(int $post_id, array $meta): void {
+    private function sync_post_meta(int $post_id, array $meta, bool $is_create = false): void {
         foreach ($meta as $key => $value) {
             if (str_starts_with($key, '_fylgja_')
                 || str_starts_with($key, '_wp_')
                 || str_starts_with($key, '_edit_')
                 || $key === '_pingme'
             ) {
+                continue;
+            }
+            // Site-local placement: seed only when the slave copy is first created;
+            // never overwrite it on later syncs, so operator curation of the slave
+            // homepage grid survives edits and Resync All.
+            if (in_array($key, self::SITE_LOCAL_META, true) && !$is_create) {
                 continue;
             }
             update_post_meta($post_id, $key, $value);
